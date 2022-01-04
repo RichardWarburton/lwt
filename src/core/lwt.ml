@@ -1550,10 +1550,19 @@ sig
 end =
 struct
   let new_pending ~how_to_cancel =
+    (* let (regular_callback, cancel_callback) = () in *)
+    let (regular_callbacks, cancel_callbacks) = 
+      match (Lwt_sampling.on_create ()) with
+      | Some (regular_callback, cancel_callback) ->
+          (Regular_callback_list_implicitly_removed_callback (fun _ -> regular_callback()),
+          Cancel_callback_list_callback (!current_storage, (fun _ -> cancel_callback())))
+      | None -> (Regular_callback_list_empty, Cancel_callback_list_empty)
+    in 
+
     let state =
       Pending {
-        regular_callbacks = Regular_callback_list_empty;
-        cancel_callbacks = Cancel_callback_list_empty;
+        regular_callbacks = regular_callbacks;
+        cancel_callbacks = cancel_callbacks;
         how_to_cancel;
         cleanups_deferred = 0;
       }
