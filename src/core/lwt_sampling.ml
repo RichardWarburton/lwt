@@ -23,9 +23,9 @@ let current_tracer = ref printing_tracer
 
 let on_create ()  =
   print_endline "lwt on_create" ;
-  if !current_tracer.sample () then
+  let current_tracer = !current_tracer in
+  if current_tracer.sample () then
     let id = !next_id in
-    let current_tracer = !current_tracer in
     let () = current_tracer.on_create id in
     let regular_callback = fun () -> current_tracer.on_resolve id in
     let cancel_callback = fun () -> current_tracer.on_cancel id in
