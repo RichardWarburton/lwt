@@ -10,7 +10,7 @@ type tracer = {
   on_cancel : id -> unit;
 }
 
-let next_id : id ref = ref 0
+let next_id : id ref = ref 1
 
 let printing_tracer = {
   sample = (fun () -> true);
