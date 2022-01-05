@@ -22,6 +22,7 @@ let printing_tracer = {
 let current_tracer = ref printing_tracer
 
 let on_create ()  =
+  print_endline "lwt on_create" ;
   if !current_tracer.sample () then
     let id = !next_id in
     let current_tracer = !current_tracer in
