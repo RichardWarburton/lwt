@@ -12,24 +12,23 @@ type tracer = {
 
 let next_id : id ref = ref 1
 
-let printing_tracer = {
-  sample = (fun () -> true);
+let default_tracer = {
+  sample = (fun () -> false);
   on_create = (fun _ -> print_endline "on_create");
   on_resolve = (fun _ -> print_endline "on_resolved");
   on_cancel = (fun _ -> print_endline "on_cancelled");
 }
 
-let current_tracer = ref printing_tracer
+let current_tracer = ref default_tracer
 
 let on_create ()  =
-  print_endline "lwt on_create" ;
   let current_tracer = !current_tracer in
   if current_tracer.sample () then
     let id = !next_id in
-    let () = current_tracer.on_create id in
+    current_tracer.on_create id;
     let regular_callback = fun () -> current_tracer.on_resolve id in
     let cancel_callback = fun () -> current_tracer.on_cancel id in
-    let () = next_id := id + 1 in
+    next_id := id + 1;
     Some (regular_callback, cancel_callback)
   else
     None
