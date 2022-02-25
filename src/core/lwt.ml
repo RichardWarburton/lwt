@@ -377,7 +377,42 @@ module Storage_map =
     end)
 type storage = (unit -> unit) Storage_map.t
 
+(* BEGIN LWT_SAMPLING CODE *)
 
+(*
+    Need to get the cause of a pending when you create it so we need to get the parent pid in the on create
+    parent promise id is conceptually the thing that you're blocking and which your resolution 
+
+    TODO: validate that when we flip between different tasks / callbacks that we are saving and restoring the promise ids correctly.
+*)
+
+open Lwt_sampling
+
+let next_pid : promise_id ref = ref 1
+
+let new_pid () =
+  let id = !next_pid in
+  next_pid := id + 1;
+  id
+
+let saved_pid : promise_id ref = ref no_parent_id
+
+let current_pid () = !saved_pid
+
+let save_pid pid = saved_pid := pid ; ()
+
+(* let with_pid pid f =
+  let old_pid = current_pid () in
+  saved_pid := pid;
+  try
+    let result = f () in
+    save_pid old_pid;
+    result
+  with ex ->
+    save_pid old_pid;
+    raise ex *)
+
+(* END LWT_SAMPLING CODE *)
 
 module Main_internal_types =
 struct
@@ -396,12 +431,11 @@ struct
 
   [@@@ocaml.warning "+37"]
 
-
-
   (* Promises proper. *)
 
   type ('a, 'u, 'c) promise = {
     mutable state : ('a, 'u, 'c) state;
+    pid : Lwt_sampling.promise_id;
   }
 
   and (_, _, _) state =
@@ -1274,7 +1308,9 @@ struct
 
   let run_in_resolution_loop f =
     let storage_snapshot = enter_resolution_loop () in
+    let old_pid = current_pid () in
     let result = f () in
+    save_pid old_pid;
     leave_resolution_loop storage_snapshot;
     result
 
@@ -1308,7 +1344,9 @@ struct
 
   let resolve ?allow_deferring ?maximum_callback_nesting_depth p result =
     let Pending callbacks = p.state in
+    let pid = p.pid in
     let p = set_promise_state p result in
+    (!current_tracer).on_resolve pid;
 
     run_callbacks_or_defer_them
       ?allow_deferring ?maximum_callback_nesting_depth callbacks result;
@@ -1427,6 +1465,7 @@ struct
      therefore be possible to cause a stack overflow using this function. *)
   let cancel p =
     let canceled_result = Rejected Canceled in
+    
 
     (* Walks the promise dependency graph backwards, looking for cancelable
        initial promises, and cancels (only) them.
@@ -1447,6 +1486,7 @@ struct
           fun (type c) callbacks_accumulator (p : (_, _, c) promise) ->
 
         let p = underlying p in
+        (!current_tracer).on_cancel p.pid;
         match p.state with
         (* If the promise is not still pending, it can't be canceled. *)
         | Fulfilled _ ->
@@ -1502,13 +1542,13 @@ sig
 end =
 struct
   let return v =
-    to_public_promise {state = Fulfilled v}
+    to_public_promise {state = Fulfilled v; pid = current_pid () }
 
   let of_result result =
-    to_public_promise {state = state_of_result result}
+    to_public_promise {state = state_of_result result; pid = current_pid () }
 
   let fail exn =
-    to_public_promise {state = Rejected exn}
+    to_public_promise {state = Rejected exn; pid = current_pid () }
 
   let return_unit = return ()
   let return_none = return None
@@ -1520,10 +1560,10 @@ struct
   let return_error x = return (Result.Error x)
 
   let fail_with msg =
-    to_public_promise {state = Rejected (Failure msg)}
+    to_public_promise {state = Rejected (Failure msg); pid = current_pid () }
 
   let fail_invalid_arg msg =
-    to_public_promise {state = Rejected (Invalid_argument msg)}
+    to_public_promise {state = Rejected (Invalid_argument msg); pid = current_pid () }
 end
 include Trivial_promises
 
@@ -1533,7 +1573,7 @@ module Pending_promises :
 sig
   (* Internal *)
   val new_pending :
-    how_to_cancel:how_to_cancel -> ('a, underlying, pending) promise
+    parent_pid:promise_id -> how_to_cancel:how_to_cancel -> ('a, underlying, pending) promise
   val propagate_cancel_to_several : _ t list -> how_to_cancel
 
   (* Initial pending promises (public) *)
@@ -1549,25 +1589,21 @@ sig
   val no_cancel : 'a t -> 'a t
 end =
 struct
-  let new_pending ~how_to_cancel =
-    (* let (regular_callback, cancel_callback) = () in *)
-    let (regular_callbacks, cancel_callbacks) = 
-      match (Lwt_sampling.on_create ()) with
-      | Some (regular_callback, cancel_callback) ->
-          (Regular_callback_list_implicitly_removed_callback (fun _ -> regular_callback()),
-          Cancel_callback_list_callback (!current_storage, (fun _ -> cancel_callback())))
-      | None -> (Regular_callback_list_empty, Cancel_callback_list_empty)
-    in 
+
+  let new_pending ~parent_pid ~how_to_cancel =
+    let pid = new_pid () in
+    let current_tracer = !current_tracer in
+    current_tracer.on_create pid parent_pid;
 
     let state =
       Pending {
-        regular_callbacks = regular_callbacks;
-        cancel_callbacks = cancel_callbacks;
+        regular_callbacks = Regular_callback_list_empty;
+        cancel_callbacks = Cancel_callback_list_empty;
         how_to_cancel;
         cleanups_deferred = 0;
       }
     in
-    {state}
+    {state = state; pid = pid}
 
   let propagate_cancel_to_several ps =
     (* Using a dirty cast here to avoid rebuilding the list :( Not bothering
@@ -1577,14 +1613,12 @@ struct
     let cast_promise_list : 'a t list -> ('a, _, _) promise list = Obj.magic in
     Propagate_cancel_to_several (cast_promise_list ps)
 
-
-
   let wait () =
-    let p = new_pending ~how_to_cancel:Not_cancelable in
+    let p = new_pending ~parent_pid:(current_pid ()) ~how_to_cancel:Not_cancelable in
     to_public_promise p, to_public_resolver p
 
   let task () =
-    let p = new_pending ~how_to_cancel:Cancel_this_promise in
+    let p = new_pending ~parent_pid:(current_pid ()) ~how_to_cancel:Cancel_this_promise in
     to_public_promise p, to_public_resolver p
 
 
@@ -1603,7 +1637,7 @@ struct
     Obj.magic node
 
   let add_task_r sequence =
-    let p = new_pending ~how_to_cancel:Cancel_this_promise in
+    let p = new_pending ~parent_pid:(current_pid ()) ~how_to_cancel:Cancel_this_promise in
     let node = Lwt_sequence.add_r (to_public_resolver p) sequence in
     let node = cast_sequence_node node p in
 
@@ -1614,7 +1648,7 @@ struct
     to_public_promise p
 
   let add_task_l sequence =
-    let p = new_pending ~how_to_cancel:Cancel_this_promise in
+    let p = new_pending ~parent_pid:(current_pid ()) ~how_to_cancel:Cancel_this_promise in
     let node = Lwt_sequence.add_l (to_public_resolver p) sequence in
     let node = cast_sequence_node node p in
 
@@ -1633,7 +1667,7 @@ struct
     | Rejected _ -> p
 
     | Pending _ ->
-      let p' = new_pending ~how_to_cancel:Cancel_this_promise in
+      let p' = new_pending ~parent_pid:p_internal.pid ~how_to_cancel:Cancel_this_promise in
 
       let callback p_result =
         let State_may_now_be_pending_proxy p' = may_now_be_proxy p' in
@@ -1674,7 +1708,7 @@ struct
     | Rejected _ -> p
 
     | Pending p_callbacks ->
-      let p' = new_pending ~how_to_cancel:Not_cancelable in
+      let p' = new_pending ~parent_pid:p_internal.pid ~how_to_cancel:Not_cancelable in
 
       let callback p_result =
         let State_may_now_be_pending_proxy p' = may_now_be_proxy p' in
@@ -1852,7 +1886,7 @@ struct
 
       Functions other than [Lwt.bind] have analogous deferral behavior. *)
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~parent_pid:p.pid ~how_to_cancel:(Propagate_cancel_to_one p) in
       (* The result promise is a fresh pending promise.
 
          Initially, trying to cancel this fresh pending promise [p''] will
@@ -1912,7 +1946,7 @@ struct
           (p'', callback, p.state))
 
     | Rejected _ as result ->
-      to_public_promise {state = result}
+      to_public_promise {state = result; pid = p.pid }
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
@@ -1924,7 +1958,7 @@ struct
     let p = underlying p in
 
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~parent_pid:p.pid ~how_to_cancel:(Propagate_cancel_to_one p) in
 
       let saved_storage = !current_storage in
 
@@ -1966,7 +2000,7 @@ struct
           (p'', callback, p.state))
 
     | Rejected exn ->
-      to_public_promise {state = Rejected (add_loc exn)}
+      to_public_promise {state = Rejected (add_loc exn); pid = p.pid }
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
@@ -1978,7 +2012,7 @@ struct
     let p = underlying p in
 
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~parent_pid:p.pid ~how_to_cancel:(Propagate_cancel_to_one p) in
 
       let saved_storage = !current_storage in
 
@@ -2014,14 +2048,14 @@ struct
         ~run_immediately_and_ensure_tail_call:true
         ~callback:(fun () ->
           to_public_promise
-            {state = try Fulfilled (f v) with exn -> Rejected exn})
+            {state = try Fulfilled (f v) with exn -> Rejected exn; ; pid = p.pid })
         ~if_deferred:(fun () ->
           let (p'', callback) =
             create_result_promise_and_callback_if_deferred () in
           (p'', callback, p.state))
 
     | Rejected _ as result ->
-      to_public_promise {state = result}
+      to_public_promise {state = result; pid = p.pid }
 
     | Pending p_callbacks ->
       let (p'', callback) = create_result_promise_and_callback_if_deferred () in
@@ -2034,7 +2068,7 @@ struct
     let p = underlying p in
 
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~parent_pid:p.pid ~how_to_cancel:(Propagate_cancel_to_one p) in
 
       let saved_storage = !current_storage in
 
@@ -2089,7 +2123,7 @@ struct
     let p = underlying p in
 
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~parent_pid:p.pid ~how_to_cancel:(Propagate_cancel_to_one p) in
 
       let saved_storage = !current_storage in
 
@@ -2144,7 +2178,7 @@ struct
     let p = underlying p in
 
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~parent_pid:p.pid ~how_to_cancel:(Propagate_cancel_to_one p) in
 
       let saved_storage = !current_storage in
 
@@ -2210,7 +2244,7 @@ struct
     let p = underlying p in
 
     let create_result_promise_and_callback_if_deferred () =
-      let p'' = new_pending ~how_to_cancel:(Propagate_cancel_to_one p) in
+      let p'' = new_pending ~parent_pid:p.pid ~how_to_cancel:(Propagate_cancel_to_one p) in
 
       let saved_storage = !current_storage in
 
@@ -2544,7 +2578,7 @@ struct
 
 
   let join ps =
-    let p' = new_pending ~how_to_cancel:(propagate_cancel_to_several ps) in
+    let p' = new_pending ~parent_pid:(current_pid ()) ~how_to_cancel:(propagate_cancel_to_several ps) in
 
     let number_pending_in_ps = ref 0 in
     let join_result = ref (Fulfilled ()) in
@@ -2582,7 +2616,7 @@ struct
       match ps with
       | [] ->
         if !number_pending_in_ps = 0 then
-          to_public_promise {state = !join_result}
+          to_public_promise {state = !join_result; pid = p'.pid }
         else
           to_public_promise p'
 
@@ -2718,7 +2752,7 @@ struct
         "Lwt.choose [] would return a promise that is pending forever";
     match count_resolved_promises_in ps with
     | 0 ->
-      let p = new_pending ~how_to_cancel:(propagate_cancel_to_several ps) in
+      let p = new_pending ~parent_pid:(current_pid ()) ~how_to_cancel:(propagate_cancel_to_several ps) in
 
       let callback result =
         let State_may_now_be_pending_proxy p = may_now_be_proxy p in
@@ -2742,7 +2776,7 @@ struct
       invalid_arg "Lwt.pick [] would return a promise that is pending forever";
     match count_resolved_promises_in ps with
     | 0 ->
-      let p = new_pending ~how_to_cancel:(propagate_cancel_to_several ps) in
+      let p = new_pending ~parent_pid:(current_pid ())  ~how_to_cancel:(propagate_cancel_to_several ps) in
 
       let callback result =
         let State_may_now_be_pending_proxy p = may_now_be_proxy p in
@@ -2811,7 +2845,7 @@ struct
           collect_already_fulfilled_promises_or_find_rejected (v::acc) ps
 
         | Rejected _ as result ->
-          to_public_promise {state = result}
+          to_public_promise {state = result; pid = p.pid }
 
         | Pending _ ->
           collect_already_fulfilled_promises_or_find_rejected acc ps
@@ -2823,7 +2857,7 @@ struct
     let rec check_for_already_resolved_promises ps' =
       match ps' with
       | [] ->
-        let p = new_pending ~how_to_cancel:(propagate_cancel_to_several ps) in
+        let p = new_pending ~parent_pid:(current_pid ()) ~how_to_cancel:(propagate_cancel_to_several ps) in
 
         let callback _result =
           let State_may_now_be_pending_proxy p = may_now_be_proxy p in
@@ -2844,7 +2878,7 @@ struct
           collect_already_fulfilled_promises_or_find_rejected [v] ps
 
         | Rejected _ as result ->
-          to_public_promise {state = result}
+          to_public_promise {state = result; pid = p.pid }
 
         | Pending _ ->
           check_for_already_resolved_promises ps
@@ -2872,7 +2906,7 @@ struct
 
         | Rejected _ as result ->
           List.iter cancel ps;
-          to_public_promise {state = result}
+          to_public_promise {state = result; pid = p.pid }
 
         | Pending _ ->
           collect_already_fulfilled_promises_or_find_rejected acc ps'
@@ -2881,7 +2915,7 @@ struct
     let rec check_for_already_resolved_promises ps' =
       match ps' with
       | [] ->
-        let p = new_pending ~how_to_cancel:(propagate_cancel_to_several ps) in
+        let p = new_pending ~parent_pid:(current_pid ()) ~how_to_cancel:(propagate_cancel_to_several ps) in
 
         let callback _result =
           let State_may_now_be_pending_proxy p = may_now_be_proxy p in
@@ -2904,7 +2938,7 @@ struct
 
         | Rejected _ as result ->
           List.iter cancel ps;
-          to_public_promise {state = result}
+          to_public_promise {state = result; pid = p.pid }
 
         | Pending _ ->
           check_for_already_resolved_promises ps'
@@ -2959,7 +2993,7 @@ struct
           collect_already_resolved_promises (v::results) pending ps
 
         | Rejected _ as result ->
-          to_public_promise {state = result}
+          to_public_promise {state = result; pid = p_internal.pid }
 
         | Pending _ ->
           collect_already_resolved_promises results (p::pending) ps
@@ -2968,7 +3002,7 @@ struct
     let rec check_for_already_resolved_promises pending_acc ps' =
       match ps' with
       | [] ->
-        let p = new_pending ~how_to_cancel:(propagate_cancel_to_several ps) in
+        let p = new_pending ~parent_pid:(current_pid ()) ~how_to_cancel:(propagate_cancel_to_several ps) in
 
         let callback _result =
           let State_may_now_be_pending_proxy p = may_now_be_proxy p in
@@ -2987,7 +3021,7 @@ struct
           collect_already_resolved_promises [v] pending_acc ps'
 
         | Rejected _ as result ->
-          to_public_promise {state = result}
+          to_public_promise {state = result; pid = p_internal.pid }
 
         | Pending _ ->
           check_for_already_resolved_promises (p::pending_acc) ps'
