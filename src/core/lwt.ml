@@ -401,7 +401,7 @@ let current_pid () = !saved_pid
 
 let save_pid pid = saved_pid := pid ; ()
 
-(* let with_pid pid f =
+let with_pid pid f =
   let old_pid = current_pid () in
   saved_pid := pid;
   try
@@ -410,7 +410,7 @@ let save_pid pid = saved_pid := pid ; ()
     result
   with ex ->
     save_pid old_pid;
-    raise ex *)
+    raise ex
 
 (* END LWT_SAMPLING CODE *)
 
@@ -1325,7 +1325,6 @@ struct
       leave_resolution_loop Storage_map.empty
 
 
-
   let run_callbacks_or_defer_them
       ?(allow_deferring = true)
       ?(maximum_callback_nesting_depth = default_maximum_callback_nesting_depth)
@@ -1343,13 +1342,15 @@ struct
         run_callbacks callbacks result)
 
   let resolve ?allow_deferring ?maximum_callback_nesting_depth p result =
+    let parent_pid = current_pid () in
     let Pending callbacks = p.state in
     let pid = p.pid in
     let p = set_promise_state p result in
-    (!current_tracer).on_resolve pid;
+    (!current_tracer).on_resolve pid parent_pid;
 
-    run_callbacks_or_defer_them
-      ?allow_deferring ?maximum_callback_nesting_depth callbacks result;
+    with_pid pid (fun () -> 
+      run_callbacks_or_defer_them
+        ?allow_deferring ?maximum_callback_nesting_depth callbacks result) ;
 
     p
 
@@ -1485,8 +1486,9 @@ struct
             packed_callbacks list =
           fun (type c) callbacks_accumulator (p : (_, _, c) promise) ->
 
+        let parent_pid = current_pid () in
         let p = underlying p in
-        (!current_tracer).on_cancel p.pid;
+        (!current_tracer).on_cancel p.pid parent_pid;
         match p.state with
         (* If the promise is not still pending, it can't be canceled. *)
         | Fulfilled _ ->
@@ -1508,15 +1510,17 @@ struct
           | Propagate_cancel_to_several ps ->
             List.fold_left cancel_and_collect_callbacks callbacks_accumulator ps
       in
+
       cancel_and_collect_callbacks [] p
     in
 
     let Internal p = to_internal_promise p in
     let callbacks = propagate_cancel p in
 
-    callbacks |> List.iter (fun (Packed callbacks) ->
-      run_callbacks_or_defer_them
-        ~allow_deferring:false callbacks canceled_result)
+    with_pid p.pid (fun () ->
+      callbacks |> List.iter (fun (Packed callbacks) ->
+        run_callbacks_or_defer_them
+          ~allow_deferring:false callbacks canceled_result))
 end
 include Resolving
 
