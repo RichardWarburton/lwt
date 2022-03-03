@@ -2612,6 +2612,8 @@ struct
       end
     in
 
+    let join_pid = p'.pid in
+
     (* Attach the above callback. Simultaneously count how many pending promises
        there are in [ps] (initially). If that number is zero, the [join] must
        resolve immediately. *)
@@ -2628,6 +2630,7 @@ struct
 
         match (underlying p).state with
         | Pending p_callbacks ->
+          (!current_tracer).on_depends p.pid join_pid;
           number_pending_in_ps := !number_pending_in_ps + 1;
           add_implicitly_removed_callback p_callbacks callback;
           attach_callback_or_resolve_immediately ps
