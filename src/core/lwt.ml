@@ -2763,6 +2763,7 @@ struct
       let callback result =
         let State_may_now_be_pending_proxy p = may_now_be_proxy p in
         let p = underlying p in
+        (!current_tracer).on_depends p.pid (current_pid ()) ;
         let State_may_have_changed p =
           resolve ~allow_deferring:false p result in
         ignore p
@@ -2788,6 +2789,7 @@ struct
         let State_may_now_be_pending_proxy p = may_now_be_proxy p in
         List.iter cancel ps;
         let p = underlying p in
+        (!current_tracer).on_depends p.pid (current_pid ()) ;
         let State_may_have_changed p =
           resolve ~allow_deferring:false p result in
         ignore p
@@ -2868,6 +2870,7 @@ struct
         let callback _result =
           let State_may_now_be_pending_proxy p = may_now_be_proxy p in
           let p = underlying p in
+          (!current_tracer).on_depends p.pid (current_pid ()) ;
           let result = collect_fulfilled_promises_after_pending [] ps in
           let State_may_have_changed p =
             resolve ~allow_deferring:false p result in
@@ -2926,6 +2929,7 @@ struct
         let callback _result =
           let State_may_now_be_pending_proxy p = may_now_be_proxy p in
           let p = underlying p in
+          (!current_tracer).on_depends p.pid (current_pid ()) ;
           let result = collect_fulfilled_promises_after_pending [] ps in
           List.iter cancel ps;
           let State_may_have_changed p =
@@ -3117,6 +3121,7 @@ struct
 
   let poll p =
     let Internal p = to_internal_promise p in
+    save_pid p.pid ;
     match (underlying p).state with
     | Rejected e -> reraise e
     | Fulfilled v -> Some v
