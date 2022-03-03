@@ -1342,11 +1342,9 @@ struct
         run_callbacks callbacks result)
 
   let resolve ?allow_deferring ?maximum_callback_nesting_depth p result =
-    let parent_pid = current_pid () in
     let Pending callbacks = p.state in
     let pid = p.pid in
     let p = set_promise_state p result in
-    (!current_tracer).on_resolve pid parent_pid;
 
     with_pid pid (fun () -> 
       run_callbacks_or_defer_them
@@ -1486,9 +1484,7 @@ struct
             packed_callbacks list =
           fun (type c) callbacks_accumulator (p : (_, _, c) promise) ->
 
-        let parent_pid = current_pid () in
         let p = underlying p in
-        (!current_tracer).on_cancel p.pid parent_pid;
         match p.state with
         (* If the promise is not still pending, it can't be canceled. *)
         | Fulfilled _ ->
@@ -1597,12 +1593,15 @@ struct
   let new_pending ~parent_pid ~how_to_cancel =
     let pid = new_pid () in
     let current_tracer = !current_tracer in
+    (* TODO: re-add sampling *)
     current_tracer.on_create pid parent_pid;
+    let regular_callback = fun _ -> current_tracer.on_resolve pid (current_pid ()) in
+    let cancel_callback = fun _ -> current_tracer.on_cancel pid (current_pid ()) in
 
     let state =
       Pending {
-        regular_callbacks = Regular_callback_list_empty;
-        cancel_callbacks = Cancel_callback_list_empty;
+        regular_callbacks = Regular_callback_list_implicitly_removed_callback regular_callback;
+        cancel_callbacks = Cancel_callback_list_callback (!current_storage, cancel_callback);
         how_to_cancel;
         cleanups_deferred = 0;
       }
